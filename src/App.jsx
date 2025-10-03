@@ -18,7 +18,7 @@ function App() {
 
   // Gmail OAuth configuration
   const GMAIL_SCOPES = 'https://www.googleapis.com/auth/gmail.modify';
-  const CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID'; // User will need to set this up
+  const CLIENT_ID = '765965414841-ci1o1mf038i6usid380kbsr83jl0pup.apps.googleusercontent.com';
   
   // Initialize Google API
   useEffect(() => {
@@ -31,16 +31,28 @@ function App() {
 
   // Add new Gmail account via OAuth
   const handleAddAccount = () => {
-    const tokenClient = window.google.accounts.oauth2.initTokenClient({
-      client_id: CLIENT_ID,
-      scope: GMAIL_SCOPES,
-      callback: async (response) => {
-        if (response.access_token) {
-          await fetchAccountInfo(response.access_token);
-        }
-      },
-    });
-    tokenClient.requestAccessToken();
+    // Check if Google API is loaded
+    if (!window.google || !window.google.accounts) {
+      setError('Google API not loaded yet. Please wait a moment and try again.');
+      return;
+    }
+
+    try {
+      const tokenClient = window.google.accounts.oauth2.initTokenClient({
+        client_id: CLIENT_ID,
+        scope: GMAIL_SCOPES,
+        callback: async (response) => {
+          if (response.access_token) {
+            await fetchAccountInfo(response.access_token);
+          } else if (response.error) {
+            setError(`OAuth error: ${response.error}`);
+          }
+        },
+      });
+      tokenClient.requestAccessToken();
+    } catch (err) {
+      setError(`Failed to initialize OAuth: ${err.message}`);
+    }
   };
 
   // Fetch account information after OAuth

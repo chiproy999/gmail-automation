@@ -167,50 +167,23 @@ function App() {
       
       // Category 1: "Google this person" requests
       if (emailText.includes('google') && (emailText.includes('search') || emailText.includes('find') || emailText.includes('look up'))) {
-        draft = `Thank you for contacting us.
-
-We don't provide research services. The information you're looking for can be found through a standard Google search.
-
-Best regards`;
+        draft = `Thank you for contacting us.\n\nWe don't provide research services. The information you're looking for can be found through a standard Google search.\n\nBest regards`;
       }
       // Category 2: Removal requests without documentation
       else if (emailText.includes('remove') && !emailText.includes('attach')) {
-        draft = `Thank you for your removal request.
-
-To process removals, we require official legal documentation. Please submit your request with supporting documents at [REMOVAL_LINK].
-
-Our legal team will review within 5-7 business days.
-
-Best regards`;
+        draft = `Thank you for your removal request.\n\nTo process removals, we require official legal documentation. Please submit your request with supporting documents at [REMOVAL_LINK].\n\nOur legal team will review within 5-7 business days.\n\nBest regards`;
       }
       // Category 3: Expungement/dismissal claims
       else if (emailText.includes('expunge') || emailText.includes('dismiss') || emailText.includes('sealed')) {
-        draft = `Thank you for contacting us regarding your case.
-
-To process expungement or dismissal removals, please attach official court documents showing the case status change.
-
-Once we verify the documentation, we'll process the removal within 24-48 hours.
-
-Best regards`;
+        draft = `Thank you for contacting us regarding your case.\n\nTo process expungement or dismissal removals, please attach official court documents showing the case status change.\n\nOnce we verify the documentation, we'll process the removal within 24-48 hours.\n\nBest regards`;
       }
       // Category 4: Threats or angry emails
       else if (emailText.includes('sue') || emailText.includes('lawyer') || emailText.includes('legal action') || emailText.includes('attorney')) {
-        draft = `We have received your communication and it has been logged.
-
-For legal matters, please direct all correspondence to: legal@[YOUR_DOMAIN]
-
-All communications are preserved and documented per standard legal procedures.
-
-Best regards`;
+        draft = `We have received your communication and it has been logged.\n\nFor legal matters, please direct all correspondence to: legal@[YOUR_DOMAIN]\n\nAll communications are preserved and documented per standard legal procedures.\n\nBest regards`;
       }
       // Category 5: Needs manual review
       else {
-        draft = `[MANUAL REVIEW NEEDED]
-
-This email requires personal attention. Please review and respond appropriately.
-
-Original message from: ${email.from}
-Subject: ${email.subject}`;
+        draft = `[MANUAL REVIEW NEEDED]\n\nThis email requires personal attention. Please review and respond appropriately.\n\nOriginal message from: ${email.from}\nSubject: ${email.subject}`;
       }
       
       setAiDraft(draft);
@@ -250,14 +223,9 @@ Subject: ${email.subject}`;
       setLearnedCount(existingLearning.length);
       
       // Create draft in Gmail
-      const draftMessage = `To: ${selectedEmail.from}
-Subject: Re: ${selectedEmail.subject}
-In-Reply-To: ${selectedEmail.id}
-References: ${selectedEmail.id}
+      const draftMessage = `To: ${selectedEmail.from}\nSubject: Re: ${selectedEmail.subject}\nIn-Reply-To: ${selectedEmail.id}\nReferences: ${selectedEmail.id}\n\n${userDraft}`;
 
-${userDraft}`;
-
-      const encodedMessage = btoa(draftMessage).replace(/\+/g, '-').replace(/\//g, '_');
+      const encodedMessage = btoa(draftMessage).replace(/+/g, '-').replace(/\/g, '_');
       
       await fetch('https://www.googleapis.com/gmail/v1/users/me/drafts', {
         method: 'POST',

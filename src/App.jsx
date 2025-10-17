@@ -15,10 +15,15 @@ function App() {
   const [error, setError] = useState('');
   const [savedCount, setSavedCount] = useState(0);
   const [learnedCount, setLearnedCount] = useState(0);
+  const [learningStats, setLearningStats] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState(null);
+  const [categoryFilter, setCategoryFilter] = useState('all'); // all, important, hold, archive
 
-  // Gmail OAuth configuration
+  // API and OAuth configuration
+  const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
   const GMAIL_SCOPES = 'https://www.googleapis.com/auth/gmail.modify';
-  const CLIENT_ID = '765965414841-ci1o1mf038i6usid380kbsr83jl0pup.apps.googleusercontent.com';
+  const CLIENT_ID = '875679301619-le0h6efnis34rkukl0n3gnfros6gcme7.apps.googleusercontent.com';
   
   // Initialize Google API
   useEffect(() => {
@@ -26,8 +31,49 @@ function App() {
     script.src = 'https://accounts.google.com/gsi/client';
     script.async = true;
     script.defer = true;
+    script.onload = () => {
+      console.log('✓ Google Identity Services loaded successfully');
+      console.log('Current URL:', window.location.href);
+    };
+    script.onerror = () => {
+      setError('Failed to load Google Identity Services library');
+    };
     document.body.appendChild(script);
+
+    // Restore saved accounts from localStorage
+    const savedAccounts = localStorage.getItem('gmail_accounts');
+    if (savedAccounts) {
+      try {
+        const parsedAccounts = JSON.parse(savedAccounts);
+        setAccounts(parsedAccounts);
+        if (parsedAccounts.length > 0) {
+          setCurrentAccount(parsedAccounts[0]);
+        }
+      } catch (err) {
+        console.error('Failed to restore accounts:', err);
+      }
+    }
   }, []);
+
+  // Load learning stats when account changes
+  useEffect(() => {
+    const loadStats = async () => {
+      if (!currentAccount) return;
+
+      try {
+        const response = await fetch(`${API_URL}/api/learning-stats/${currentAccount.email}`);
+        if (response.ok) {
+          const stats = await response.json();
+          setLearningStats(stats);
+          setLearnedCount(stats.total_edits);
+        }
+      } catch (err) {
+        console.error('Failed to load stats:', err);
+      }
+    };
+
+    loadStats();
+  }, [currentAccount]);
 
   // Add new Gmail account via OAuth
   const handleAddAccount = () => {
@@ -42,16 +88,33 @@ function App() {
         client_id: CLIENT_ID,
         scope: GMAIL_SCOPES,
         callback: async (response) => {
+          console.log('OAuth Response:', response);
+
           if (response.access_token) {
             await fetchAccountInfo(response.access_token);
           } else if (response.error) {
-            setError(`OAuth error: ${response.error}`);
+            // Show detailed error
+            let errorMsg = `OAuth error: ${response.error}`;
+
+            if (response.error === 'access_denied') {
+              errorMsg = 'Access denied. You need to click "Allow" to grant permissions.';
+            } else if (response.error === 'invalid_client') {
+              errorMsg = 'Invalid OAuth client. Check your Google Cloud Console settings.';
+            } else if (response.error_description) {
+              errorMsg += ` - ${response.error_description}`;
+            }
+
+            setError(errorMsg);
+            console.error('OAuth Error Details:', response);
           }
         },
       });
-      tokenClient.requestAccessToken();
+
+      // Request the token (with prompt to select account)
+      tokenClient.requestAccessToken({ prompt: 'select_account' });
     } catch (err) {
       setError(`Failed to initialize OAuth: ${err.message}`);
+      console.error('OAuth Init Error:', err);
     }
   };
 
@@ -61,19 +124,34 @@ function App() {
       const response = await fetch('https://www.googleapis.com/gmail/v1/users/me/profile', {
         headers: { Authorization: `Bearer ${accessToken}` }
       });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Gmail API error (${response.status}): ${errorData.error?.message || 'Unknown error'}`);
+      }
+
       const profile = await response.json();
-      
+
       const newAccount = {
         email: profile.emailAddress,
         accessToken: accessToken,
-        id: profile.emailAddress
+        id: profile.emailAddress,
+        tokenExpiry: Date.now() + 3600000 // Token expires in 1 hour
       };
-      
-      setAccounts(prev => [...prev, newAccount]);
+
+      const updatedAccounts = [...accounts, newAccount];
+      setAccounts(updatedAccounts);
       setCurrentAccount(newAccount);
+
+      // Save to localStorage for session persistence
+      localStorage.setItem('gmail_accounts', JSON.stringify(updatedAccounts));
+
       await loadEmails(newAccount);
+      setError(''); // Clear any previous errors
+      alert(`✓ Successfully connected ${profile.emailAddress}`);
     } catch (err) {
-      setError('Failed to connect Gmail account');
+      setError(`Failed to connect Gmail: ${err.message}`);
+      console.error('OAuth Error:', err);
     }
   };
 
@@ -81,22 +159,60 @@ function App() {
   const loadEmails = async (account) => {
     setLoading(true);
     setError('');
-    
+
     try {
       const response = await fetch(
-        'https://www.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=is:unread OR newer_than:7d',
+        'https://www.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=in:inbox (is:unread OR newer_than:7d) -from:me',
         {
           headers: { Authorization: `Bearer ${account.accessToken}` }
         }
       );
-      
+
       const data = await response.json();
-      
+
       if (data.messages) {
         const emailDetails = await Promise.all(
           data.messages.slice(0, 20).map(msg => fetchEmailDetail(msg.id, account.accessToken))
         );
-        setEmails(emailDetails);
+
+        // Auto-categorize emails
+        const categorizedEmails = await Promise.all(
+          emailDetails.map(async (email) => {
+            if (!email) return email;
+
+            try {
+              // Call backend to categorize
+              const catResponse = await fetch(`${API_URL}/api/categorize-email`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  email: {
+                    from: email.from,
+                    subject: email.subject,
+                    body: email.body || email.snippet
+                  },
+                  accountEmail: account.email
+                })
+              });
+
+              if (catResponse.ok) {
+                const catData = await catResponse.json();
+                return {
+                  ...email,
+                  category: catData.category,
+                  importance: catData.importance,
+                  autoAction: catData.autoAction // 'archive', 'important', 'hold', 'respond'
+                };
+              }
+            } catch (err) {
+              console.error('Categorization error:', err);
+            }
+
+            return { ...email, category: 'unknown', importance: 'medium', autoAction: 'hold' };
+          })
+        );
+
+        setEmails(categorizedEmails.filter(e => e));
       } else {
         setEmails([]);
       }
@@ -116,10 +232,10 @@ function App() {
           headers: { Authorization: `Bearer ${accessToken}` }
         }
       );
-      
+
       const message = await response.json();
       const headers = message.payload.headers;
-      
+
       const getHeader = (name) => {
         const header = headers.find(h => h.name.toLowerCase() === name.toLowerCase());
         return header ? header.value : '';
@@ -135,7 +251,27 @@ function App() {
           body = atob(textPart.body.data.replace(/-/g, '+').replace(/_/g, '/'));
         }
       }
-      
+
+      // Get attachments
+      const attachments = [];
+      const getAllParts = (parts) => {
+        if (!parts) return;
+        for (const part of parts) {
+          if (part.filename && part.body && part.body.attachmentId) {
+            attachments.push({
+              filename: part.filename,
+              mimeType: part.mimeType,
+              attachmentId: part.body.attachmentId,
+              size: part.body.size
+            });
+          }
+          if (part.parts) {
+            getAllParts(part.parts);
+          }
+        }
+      };
+      getAllParts(message.payload.parts);
+
       return {
         id: message.id,
         threadId: message.threadId,
@@ -143,7 +279,8 @@ function App() {
         subject: getHeader('Subject'),
         date: new Date(parseInt(message.internalDate)),
         snippet: message.snippet,
-        body: body.substring(0, 500) // First 500 chars for preview
+        body: body.substring(0, 500), // First 500 chars for preview
+        attachments: attachments
       };
     } catch (err) {
       console.error('Error fetching email:', err);
@@ -155,42 +292,46 @@ function App() {
   const generateAIDraft = async (email) => {
     setLoading(true);
     setError('');
-    
+
     try {
-      // This is a placeholder for AI draft generation
-      // In production, you'd call your backend API that uses GPT-4 or Claude
-      
-      // Analyze email content to determine category
-      const emailText = `${email.subject} ${email.body}`.toLowerCase();
-      
-      let draft = '';
-      
-      // Category 1: "Google this person" requests
-      if (emailText.includes('google') && (emailText.includes('search') || emailText.includes('find') || emailText.includes('look up'))) {
-        draft = `Thank you for contacting us.\n\nWe don't provide research services. The information you're looking for can be found through a standard Google search.\n\nBest regards`;
+      // Call backend AI API with attachments
+      const response = await fetch(`${API_URL}/api/generate-draft`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          email: {
+            id: email.id,
+            from: email.from,
+            subject: email.subject,
+            body: email.body,
+            snippet: email.snippet
+          },
+          accountEmail: currentAccount.email,
+          attachments: email.attachments || [],
+          accessToken: currentAccount.accessToken
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('Backend API error');
       }
-      // Category 2: Removal requests without documentation
-      else if (emailText.includes('remove') && !emailText.includes('attach')) {
-        draft = `Thank you for your removal request.\n\nTo process removals, we require official legal documentation. Please submit your request with supporting documents at [REMOVAL_LINK].\n\nOur legal team will review within 5-7 business days.\n\nBest regards`;
+
+      const data = await response.json();
+
+      setAiDraft(data.aiDraft);
+      setUserDraft(data.aiDraft); // Initialize user draft with AI draft
+
+      // Store category and importance
+      if (selectedEmail) {
+        selectedEmail.category = data.category;
+        selectedEmail.importance = data.importance;
       }
-      // Category 3: Expungement/dismissal claims
-      else if (emailText.includes('expunge') || emailText.includes('dismiss') || emailText.includes('sealed')) {
-        draft = `Thank you for contacting us regarding your case.\n\nTo process expungement or dismissal removals, please attach official court documents showing the case status change.\n\nOnce we verify the documentation, we'll process the removal within 24-48 hours.\n\nBest regards`;
-      }
-      // Category 4: Threats or angry emails
-      else if (emailText.includes('sue') || emailText.includes('lawyer') || emailText.includes('legal action') || emailText.includes('attorney')) {
-        draft = `We have received your communication and it has been logged.\n\nFor legal matters, please direct all correspondence to: legal@[YOUR_DOMAIN]\n\nAll communications are preserved and documented per standard legal procedures.\n\nBest regards`;
-      }
-      // Category 5: Needs manual review
-      else {
-        draft = `[MANUAL REVIEW NEEDED]\n\nThis email requires personal attention. Please review and respond appropriately.\n\nOriginal message from: ${email.from}\nSubject: ${email.subject}`;
-      }
-      
-      setAiDraft(draft);
-      setUserDraft(draft); // Initialize user draft with AI draft
-      
+
     } catch (err) {
-      setError('Failed to generate AI draft');
+      setError('Failed to generate AI draft. Make sure backend is running on port 3001.');
+      console.error('AI Draft Error:', err);
     } finally {
       setLoading(false);
     }
@@ -199,35 +340,51 @@ function App() {
   // Save draft to Gmail
   const saveDraft = async () => {
     if (!currentAccount || !selectedEmail) return;
-    
+
     setLoading(true);
     setError('');
-    
-    try {
-      // Track learning: what did AI suggest vs what user wrote
-      const learningData = {
-        timestamp: new Date().toISOString(),
-        emailId: selectedEmail.id,
-        from: selectedEmail.from,
-        subject: selectedEmail.subject,
-        aiDraft: aiDraft,
-        userDraft: userDraft,
-        changes: calculateChanges(aiDraft, userDraft),
-        account: currentAccount.email
-      };
-      
-      // Save learning data to localStorage (in production, send to backend)
-      const existingLearning = JSON.parse(localStorage.getItem('gmail_learning') || '[]');
-      existingLearning.push(learningData);
-      localStorage.setItem('gmail_learning', JSON.stringify(existingLearning));
-      setLearnedCount(existingLearning.length);
-      
-      // Create draft in Gmail
-      const draftMessage = `To: ${selectedEmail.from}\nSubject: Re: ${selectedEmail.subject}\nIn-Reply-To: ${selectedEmail.id}\nReferences: ${selectedEmail.id}\n\n${userDraft}`;
 
-      const encodedMessage = btoa(draftMessage).replace(/+/g, '-').replace(/\/g, '_');
-      
-      await fetch('https://www.googleapis.com/gmail/v1/users/me/drafts', {
+    try {
+      // Send learning data to backend
+      const learningResponse = await fetch(`${API_URL}/api/save-learning`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          timestamp: new Date().toISOString(),
+          accountEmail: currentAccount.email,
+          emailId: selectedEmail.id,
+          fromEmail: selectedEmail.from,
+          subject: selectedEmail.subject,
+          emailBody: selectedEmail.body,
+          aiDraft: aiDraft,
+          userDraft: userDraft,
+          category: selectedEmail.category || 'unknown',
+          importance: selectedEmail.importance || 'medium'
+        })
+      });
+
+      if (learningResponse.ok) {
+        const learningResult = await learningResponse.json();
+        setLearnedCount(prev => prev + 1);
+        console.log(learningResult.message);
+      }
+
+      // Create draft in Gmail with proper MIME format
+      const draftMessage = `From: ${currentAccount.email}
+To: ${selectedEmail.from}
+Subject: Re: ${selectedEmail.subject}
+Content-Type: text/plain; charset=UTF-8
+
+${userDraft}`;
+
+      const encodedMessage = btoa(unescape(encodeURIComponent(draftMessage)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const draftResponse = await fetch('https://www.googleapis.com/gmail/v1/users/me/drafts', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${currentAccount.accessToken}`,
@@ -240,18 +397,115 @@ function App() {
           }
         })
       });
-      
+
+      if (!draftResponse.ok) {
+        const errorData = await draftResponse.json();
+        throw new Error(`Failed to save draft: ${errorData.error?.message || 'Unknown error'}`);
+      }
+
+      const draftResult = await draftResponse.json();
+      console.log('✓ Draft saved successfully:', draftResult.id);
+
       setSavedCount(prev => prev + 1);
-      alert('Draft saved to Gmail! ✓');
-      
+      alert('Draft saved to Gmail! ✓\n\nCheck your Gmail Drafts folder.');
+
       // Clear selection
       setSelectedEmail(null);
       setAiDraft('');
       setUserDraft('');
-      
+
     } catch (err) {
       setError('Failed to save draft to Gmail');
       console.error(err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Send email immediately
+  const sendEmail = async () => {
+    if (!currentAccount || !selectedEmail) return;
+
+    if (!confirm(`Send this email to ${selectedEmail.from}?`)) {
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      // Send learning data to backend first
+      const learningResponse = await fetch(`${API_URL}/api/save-learning`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          timestamp: new Date().toISOString(),
+          accountEmail: currentAccount.email,
+          emailId: selectedEmail.id,
+          fromEmail: selectedEmail.from,
+          subject: selectedEmail.subject,
+          emailBody: selectedEmail.body,
+          aiDraft: aiDraft,
+          userDraft: userDraft,
+          category: selectedEmail.category || 'unknown',
+          importance: selectedEmail.importance || 'medium'
+        })
+      });
+
+      if (learningResponse.ok) {
+        const learningResult = await learningResponse.json();
+        setLearnedCount(prev => prev + 1);
+        console.log(learningResult.message);
+      }
+
+      // Send email directly
+      const emailMessage = `From: ${currentAccount.email}
+To: ${selectedEmail.from}
+Subject: Re: ${selectedEmail.subject}
+Content-Type: text/plain; charset=UTF-8
+
+${userDraft}`;
+
+      const encodedMessage = btoa(unescape(encodeURIComponent(emailMessage)))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+
+      const sendResponse = await fetch('https://www.googleapis.com/gmail/v1/users/me/messages/send', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${currentAccount.accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          raw: encodedMessage,
+          threadId: selectedEmail.threadId
+        })
+      });
+
+      if (!sendResponse.ok) {
+        const errorData = await sendResponse.json();
+        throw new Error(`Failed to send: ${errorData.error?.message || 'Unknown error'}`);
+      }
+
+      const sendResult = await sendResponse.json();
+      console.log('✓ Email sent successfully:', sendResult.id);
+
+      alert('✓ Email sent successfully!');
+
+      // Archive the original email
+      await handleArchiveEmail(selectedEmail);
+
+      // Clear selection
+      setSelectedEmail(null);
+      setAiDraft('');
+      setUserDraft('');
+
+    } catch (err) {
+      setError(`Failed to send email: ${err.message}`);
+      console.error('Send error:', err);
     } finally {
       setLoading(false);
     }
@@ -303,6 +557,271 @@ function App() {
     await generateAIDraft(email);
   };
 
+  // Archive email (remove from inbox only, don't delete)
+  const handleArchiveEmail = async (email) => {
+    try {
+      const response = await fetch(
+        `https://www.googleapis.com/gmail/v1/users/me/messages/${email.id}/modify`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${currentAccount.accessToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            removeLabelIds: ['INBOX']
+          })
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Gmail API error: ${errorData.error?.message || 'Unknown error'}`);
+      }
+
+      console.log('✓ Archived email:', email.subject);
+
+      // Remove from local list
+      setEmails(prev => prev.filter(e => e.id !== email.id));
+    } catch (err) {
+      setError(`Failed to archive email: ${err.message}`);
+      console.error('Archive error:', err);
+    }
+  };
+
+  // Archive all filtered emails
+  const handleArchiveAll = async () => {
+    const filtered = getFilteredEmails();
+
+    if (filtered.length === 0) {
+      return;
+    }
+
+    if (!confirm(`Archive all ${filtered.length} emails in this view?\n\nThis will remove them from inbox (still searchable in All Mail)`)) {
+      return;
+    }
+
+    setLoading(true);
+    let archived = 0;
+    let failed = 0;
+
+    for (const email of filtered) {
+      try {
+        const response = await fetch(
+          `https://www.googleapis.com/gmail/v1/users/me/messages/${email.id}/modify`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${currentAccount.accessToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              removeLabelIds: ['INBOX']
+            })
+          }
+        );
+
+        if (response.ok) {
+          archived++;
+          console.log('✓ Archived:', email.subject);
+        } else {
+          failed++;
+          const errorData = await response.json();
+          console.error('Failed to archive:', email.subject, errorData);
+        }
+      } catch (err) {
+        failed++;
+        console.error('Failed to archive:', email.id, err);
+      }
+    }
+
+    // Remove archived emails from local list
+    setEmails(prev => prev.filter(e => !filtered.find(f => f.id === e.id)));
+    setLoading(false);
+
+    if (failed > 0) {
+      alert(`✓ Archived ${archived} emails\n❌ Failed: ${failed} emails`);
+    } else {
+      alert(`✓ Successfully archived ${archived} emails`);
+    }
+  };
+
+  // Get filtered emails based on category
+  const getFilteredEmails = () => {
+    if (categoryFilter === 'all') return emails;
+    if (categoryFilter === 'important') return emails.filter(e => e.importance === 'high');
+    if (categoryFilter === 'respond') return emails.filter(e => e.autoAction === 'respond');
+    if (categoryFilter === 'archive') return emails.filter(e => e.autoAction === 'archive');
+    return emails;
+  };
+
+  // Get badge color based on importance
+  const getBadgeColor = (importance, autoAction) => {
+    if (autoAction === 'archive') return 'bg-gray-100 text-gray-600';
+    if (importance === 'high') return 'bg-red-100 text-red-700';
+    if (importance === 'low') return 'bg-gray-100 text-gray-600';
+    return 'bg-yellow-100 text-yellow-700';
+  };
+
+  // Get badge label
+  const getBadgeLabel = (importance, autoAction, category) => {
+    if (autoAction === 'archive') return '📦 Archive';
+    if (importance === 'high') return '🔴 Important';
+    if (category === 'removal_request') return '🗑️ Removal';
+    if (category === 'newsletter') return '📰 Newsletter';
+    return '⏸️ Hold';
+  };
+
+  // Import historical emails for training
+  const handleImportEmails = async () => {
+    if (!currentAccount) {
+      setError('Please connect an account first');
+      return;
+    }
+
+    if (!confirm('Import last 6 months of sent emails for training?\n\nThis will:\n- Fetch your sent emails\n- Pair them with originals\n- Train the AI on your writing style\n\nCost: ~$0.50 for GPT analysis')) {
+      return;
+    }
+
+    setImporting(true);
+    setImportProgress('Fetching sent emails from last 6 months...');
+    setError('');
+
+    try {
+      // Calculate date 6 months ago
+      const sixMonthsAgo = new Date();
+      sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+      const afterDate = Math.floor(sixMonthsAgo.getTime() / 1000);
+
+      // Fetch sent emails
+      const sentResponse = await fetch(
+        `https://www.googleapis.com/gmail/v1/users/me/messages?maxResults=50&q=in:sent after:${afterDate}`,
+        {
+          headers: { Authorization: `Bearer ${currentAccount.accessToken}` }
+        }
+      );
+
+      const sentData = await sentResponse.json();
+
+      if (!sentData.messages || sentData.messages.length === 0) {
+        setError('No sent emails found in last 6 months');
+        setImporting(false);
+        return;
+      }
+
+      setImportProgress(`Found ${sentData.messages.length} sent emails. Fetching details...`);
+
+      // Fetch details for sent emails and match with originals
+      const emailPairs = [];
+      let processed = 0;
+
+      for (const msg of sentData.messages.slice(0, 50)) { // Limit to 50 to avoid timeout
+        try {
+          processed++;
+          if (processed % 10 === 0) {
+            setImportProgress(`Processing ${processed}/${Math.min(50, sentData.messages.length)} emails...`);
+          }
+
+          const sentEmail = await fetchEmailDetail(msg.id, currentAccount.accessToken);
+
+          if (!sentEmail || !sentEmail.body) continue;
+
+          // Try to find the original email this was replying to
+          // Look for In-Reply-To header
+          const threadResponse = await fetch(
+            `https://www.googleapis.com/gmail/v1/users/me/threads/${sentEmail.threadId}?format=full`,
+            {
+              headers: { Authorization: `Bearer ${currentAccount.accessToken}` }
+            }
+          );
+
+          const threadData = await threadResponse.json();
+
+          if (threadData.messages && threadData.messages.length >= 2) {
+            // First message is usually the original, last is the sent reply
+            const originalMsg = threadData.messages[0];
+            const originalHeaders = originalMsg.payload.headers;
+
+            const getHeader = (name) => {
+              const header = originalHeaders.find(h => h.name.toLowerCase() === name.toLowerCase());
+              return header ? header.value : '';
+            };
+
+            let originalBody = '';
+            if (originalMsg.payload.body.data) {
+              originalBody = atob(originalMsg.payload.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+            } else if (originalMsg.payload.parts) {
+              const textPart = originalMsg.payload.parts.find(part => part.mimeType === 'text/plain');
+              if (textPart && textPart.body.data) {
+                originalBody = atob(textPart.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+              }
+            }
+
+            emailPairs.push({
+              originalEmail: {
+                id: originalMsg.id,
+                from: getHeader('From'),
+                subject: getHeader('Subject'),
+                body: originalBody.substring(0, 1000),
+                snippet: originalMsg.snippet
+              },
+              yourResponse: {
+                body: sentEmail.body,
+                date: sentEmail.date.toISOString()
+              }
+            });
+          }
+        } catch (err) {
+          console.error('Error processing email:', err);
+        }
+      }
+
+      if (emailPairs.length === 0) {
+        setError('Could not find any email pairs to import');
+        setImporting(false);
+        return;
+      }
+
+      setImportProgress(`Importing ${emailPairs.length} email pairs to database...`);
+
+      // Send to backend for import
+      const importResponse = await fetch(`${API_URL}/api/import-emails`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          emailPairs,
+          accountEmail: currentAccount.email
+        })
+      });
+
+      const importResult = await importResponse.json();
+
+      if (importResult.success) {
+        setImportProgress(null);
+        alert(`🎉 Success!\n\n${importResult.imported} emails imported\nAI Accuracy: ${importResult.avgSimilarity}%\n\n${importResult.message}`);
+
+        // Reload stats
+        const statsResponse = await fetch(`${API_URL}/api/learning-stats/${currentAccount.email}`);
+        if (statsResponse.ok) {
+          const stats = await statsResponse.json();
+          setLearningStats(stats);
+          setLearnedCount(stats.total_edits);
+        }
+      } else {
+        setError('Import failed: ' + importResult.error);
+      }
+
+    } catch (err) {
+      setError('Failed to import emails: ' + err.message);
+      console.error('Import error:', err);
+    } finally {
+      setImporting(false);
+      setImportProgress(null);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -318,10 +837,23 @@ function App() {
             </div>
             
             <div className="flex items-center gap-4">
+              {learningStats && (
+                <div className="text-sm">
+                  <div className="flex items-center gap-2 px-3 py-2 bg-purple-50 rounded-lg">
+                    <div>
+                      <div className="font-semibold text-purple-900">
+                        AI Accuracy: {learningStats.avg_similarity_percent}%
+                      </div>
+                      <div className="text-xs text-purple-700">
+                        {learningStats.total_edits} emails trained
+                        {learningStats.readyForAutoSend && ' • ✓ Ready for auto-send!'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
               <div className="text-sm text-gray-600">
                 <span className="font-semibold">{savedCount}</span> drafts saved
-                <span className="mx-2">•</span>
-                <span className="font-semibold">{learnedCount}</span> learned
               </div>
               
               {currentAccount && (
@@ -338,10 +870,30 @@ function App() {
                 <Plus className="w-4 h-4" />
                 Add Account
               </button>
+
+              {currentAccount && (
+                <button
+                  onClick={handleImportEmails}
+                  disabled={importing}
+                  className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {importing ? '⏳' : '📥'} {importing ? 'Importing...' : 'Import Training Data'}
+                </button>
+              )}
             </div>
           </div>
         </div>
       </div>
+
+      {/* Import Progress */}
+      {importProgress && (
+        <div className="max-w-7xl mx-auto px-4 mt-4">
+          <div className="bg-purple-50 border border-purple-200 rounded-lg p-4 flex items-center gap-2">
+            <div className="animate-spin">⏳</div>
+            <p className="text-purple-800">{importProgress}</p>
+          </div>
+        </div>
+      )}
 
       {/* Error Display */}
       {error && (
@@ -400,43 +952,123 @@ function App() {
               {/* Email List */}
               <div className="bg-white rounded-lg shadow-sm">
                 <div className="p-4 border-b border-gray-200">
-                  <h3 className="font-semibold text-gray-900">
-                    Emails ({emails.length})
-                  </h3>
+                  <div className="flex items-center justify-between mb-3">
+                    <h3 className="font-semibold text-gray-900">
+                      Emails ({getFilteredEmails().length})
+                    </h3>
+
+                    {/* Bulk Archive Button */}
+                    {getFilteredEmails().length > 0 && (
+                      <button
+                        onClick={handleArchiveAll}
+                        disabled={loading}
+                        className="px-3 py-1 text-xs bg-gray-600 text-white rounded hover:bg-gray-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        📦 Archive All ({getFilteredEmails().length})
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Filter Tabs */}
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setCategoryFilter('all')}
+                      className={`px-3 py-1 text-sm rounded-full ${
+                        categoryFilter === 'all'
+                          ? 'bg-blue-100 text-blue-700 font-medium'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      All
+                    </button>
+                    <button
+                      onClick={() => setCategoryFilter('important')}
+                      className={`px-3 py-1 text-sm rounded-full ${
+                        categoryFilter === 'important'
+                          ? 'bg-red-100 text-red-700 font-medium'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      🔴 Important
+                    </button>
+                    <button
+                      onClick={() => setCategoryFilter('respond')}
+                      className={`px-3 py-1 text-sm rounded-full ${
+                        categoryFilter === 'respond'
+                          ? 'bg-green-100 text-green-700 font-medium'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      ✉️ Respond
+                    </button>
+                    <button
+                      onClick={() => setCategoryFilter('archive')}
+                      className={`px-3 py-1 text-sm rounded-full ${
+                        categoryFilter === 'archive'
+                          ? 'bg-gray-100 text-gray-700 font-medium'
+                          : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                      }`}
+                    >
+                      📦 Archive
+                    </button>
+                  </div>
                 </div>
                 <div className="divide-y divide-gray-200 max-h-[600px] overflow-y-auto">
                   {loading && emails.length === 0 ? (
                     <div className="p-8 text-center text-gray-500">
                       Loading emails...
                     </div>
-                  ) : emails.length === 0 ? (
+                  ) : getFilteredEmails().length === 0 ? (
                     <div className="p-8 text-center text-gray-500">
-                      No emails found
+                      No emails in this category
                     </div>
                   ) : (
-                    emails.map(email => (
-                      <button
+                    getFilteredEmails().map(email => (
+                      <div
                         key={email.id}
-                        onClick={() => handleSelectEmail(email)}
-                        className={`w-full text-left p-4 hover:bg-gray-50 transition ${
+                        className={`relative group ${
                           selectedEmail?.id === email.id ? 'bg-blue-50' : ''
                         }`}
                       >
-                        <div className="flex justify-between items-start mb-1">
-                          <p className="font-medium text-gray-900 text-sm truncate pr-2">
-                            {email.from.split('<')[0].trim() || email.from}
+                        <button
+                          onClick={() => handleSelectEmail(email)}
+                          className="w-full text-left p-4 hover:bg-gray-50 transition"
+                        >
+                          <div className="flex justify-between items-start mb-1">
+                            <div className="flex items-center gap-2 flex-1">
+                              <p className="font-medium text-gray-900 text-sm truncate">
+                                {email.from.split('<')[0].trim() || email.from}
+                              </p>
+                              <span className={`text-xs px-2 py-0.5 rounded-full ${getBadgeColor(email.importance, email.autoAction)}`}>
+                                {getBadgeLabel(email.importance, email.autoAction, email.category)}
+                              </span>
+                            </div>
+                            <span className="text-xs text-gray-500 whitespace-nowrap ml-2">
+                              {email.date.toLocaleDateString()}
+                            </span>
+                          </div>
+                          <p className="text-sm font-medium text-gray-700 mb-1 truncate">
+                            {email.subject}
                           </p>
-                          <span className="text-xs text-gray-500 whitespace-nowrap">
-                            {email.date.toLocaleDateString()}
-                          </span>
+                          <p className="text-xs text-gray-500 line-clamp-2">
+                            {email.snippet}
+                          </p>
+                        </button>
+
+                        {/* Quick Actions - Always visible */}
+                        <div className="absolute right-2 top-2 flex gap-1">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleArchiveEmail(email);
+                            }}
+                            className="px-2 py-1 text-xs bg-gray-600 text-white rounded hover:bg-gray-700 transition"
+                            title="Archive this email"
+                          >
+                            📦
+                          </button>
                         </div>
-                        <p className="text-sm font-medium text-gray-700 mb-1 truncate">
-                          {email.subject}
-                        </p>
-                        <p className="text-xs text-gray-500 line-clamp-2">
-                          {email.snippet}
-                        </p>
-                      </button>
+                      </div>
                     ))
                   )}
                 </div>
@@ -512,10 +1144,18 @@ function App() {
                       <button
                         onClick={saveDraft}
                         disabled={loading || !userDraft.trim()}
-                        className="flex items-center gap-2 px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                        className="flex items-center gap-2 px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
                       >
                         <Save className="w-4 h-4" />
-                        Save Draft to Gmail
+                        Save Draft
+                      </button>
+                      <button
+                        onClick={sendEmail}
+                        disabled={loading || !userDraft.trim()}
+                        className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Send className="w-4 h-4" />
+                        Send Now
                       </button>
                     </div>
 
